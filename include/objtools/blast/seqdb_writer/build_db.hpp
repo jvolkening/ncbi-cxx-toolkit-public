@@ -202,6 +202,22 @@ public:
                    Uint8                  oid_masks = EOidMaskType::fNone,
                    bool scan_bioseq_4_cfastareader_usrobj = true);
 
+    /// As above, with optional deletion of an existing output database.
+    /// Set delete_existing to false only for a new, isolated output path.
+    CBuildDatabase(const string         & dbname,
+                   const string         & title,
+                   bool                   is_protein,
+                   bool                   sparse,
+                   bool                   parse_seqids,
+                   bool                   use_gi_mask,
+                   ostream              * logfile,
+                   bool                   long_seqids,
+                   EBlastDbVersion        dbver,
+                   bool                   limit_defline,
+                   Uint8                  oid_masks,
+                   bool                   scan_bioseq_4_cfastareader_usrobj,
+                   bool                   delete_existing);
+
     ~CBuildDatabase();
 
     /// Specify a mapping of sequence ids to taxonomic ids.

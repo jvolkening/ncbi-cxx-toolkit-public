@@ -28,9 +28,16 @@ class TestTaxonClusterDb(unittest.TestCase):
                         "-blastdb_version", str(version), "-out", "db"],
                        cwd=self.work, check=True, capture_output=True, text=True)
 
-    def run_cluster(self, *args, env=None):
+    def run_cluster(self, *args, env=None, preexec_fn=None):
         return subprocess.run(["taxonclusterdb", "-db", "db", *args], cwd=self.work,
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True, env=env,
+                              preexec_fn=preexec_fn)
+
+    def test_help(self):
+        result = subprocess.run(["taxonclusterdb", "-help"], cwd=self.work,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-tax_nodes", result.stdout)
 
     def test_exact_taxonomy_and_singletons(self):
         self.make_db(5)
@@ -119,6 +126,83 @@ class TestTaxonClusterDb(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(taxid.stdout.strip(), expected)
 
+    @unittest.skipUnless(shutil.which("blastdb_aliastool") and shutil.which("blastdbcmd"),
+                         "blastdb_aliastool and blastdbcmd must be on PATH")
+    def test_filtered_alias_retains_only_selected_oids(self):
+        self.make_db(5)
+        (self.work / "ids").write_text("b\nc\n")
+        subprocess.run(["blastdb_aliastool", "-db", "db", "-dbtype", "nucl",
+                        "-seqidlist", "ids", "-out", "selected"],
+                       cwd=self.work, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["taxonclusterdb", "-db", "selected", "-out_dir", "selected-output"],
+            cwd=self.work, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.work / "selected-output/data/clusters.tsv").read_text(),
+                         "representative_oid\tmember_oid\n1\t1\n2\t2\n")
+        records = subprocess.run(
+            ["blastdbcmd", "-db", "selected-output/data/db", "-entry", "all",
+             "-outfmt", "%a %T"], cwd=self.work, check=True, capture_output=True, text=True)
+        self.assertEqual(set(records.stdout.splitlines()), {"b 11", "c 12"})
+
+    @unittest.skipUnless(shutil.which("blastdb_aliastool") and shutil.which("blastdbcmd"),
+                         "blastdb_aliastool and blastdbcmd must be on PATH")
+    def test_multi_volume_alias(self):
+        self.make_db(5)
+        (self.work / "input2.fa").write_text(
+            ">f\nACGTACGTACGTACGN\n>g\nACGTACGTACGTACGC\n")
+        (self.work / "taxids2.txt").write_text("f 11\ng 11\n")
+        subprocess.run(["makeblastdb", "-in", "input2.fa", "-dbtype", "nucl",
+                        "-parse_seqids", "-taxid_map", "taxids2.txt",
+                        "-blastdb_version", "5", "-out", "db2"],
+                       cwd=self.work, check=True, capture_output=True, text=True)
+        subprocess.run(["blastdb_aliastool", "-dblist", "db db2", "-dbtype", "nucl",
+                        "-title", "combined", "-out", "combined"], cwd=self.work, check=True,
+                       capture_output=True, text=True)
+        result = subprocess.run(
+            ["taxonclusterdb", "-db", "combined", "-out_dir", "combined-output"],
+            cwd=self.work, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.work / "combined-output/data/clusters.tsv").read_text(),
+                         "representative_oid\tmember_oid\n"
+                         "0\t0\n0\t1\n2\t2\n3\t3\n4\t4\n0\t5\n6\t6\n")
+        info = subprocess.run(
+            ["blastdbcmd", "-db", "combined-output/data/db", "-info"],
+            cwd=self.work, check=True, capture_output=True, text=True)
+        self.assertRegex(info.stdout, r"\b5 sequences\b")
+
+    @unittest.skipUnless(shutil.which("blastn"), "blastn must be on PATH")
+    def test_megablast_search_of_output(self):
+        rng = random.Random(42)
+        first = "".join(rng.choice("ACGT") for _ in range(300))
+        second = "".join(rng.choice("ACGT") for _ in range(300))
+        changed = first[:100] + ("C" if first[100] == "A" else "A") + first[101:]
+        (self.work / "input.fa").write_text(
+            ">a\n" + first + "\n>b\n" + changed + "\n>c\n" + second + "\n")
+        (self.work / "taxids.txt").write_text("a 11\nb 11\nc 12\n")
+        (self.work / "queries.fa").write_text(">q1\n" + first + "\n>q2\n" + second + "\n")
+        self.make_db(5)
+        result = self.run_cluster("-near", "-out_dir", "search-output")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        def best_taxids(db):
+            output = subprocess.run(
+                ["blastn", "-task", "megablast", "-db", db, "-query", "queries.fa",
+                 "-dust", "no", "-outfmt", "6 qseqid staxids bitscore"],
+                cwd=self.work, check=True, capture_output=True, text=True)
+            best = {}
+            for line in output.stdout.splitlines():
+                query, taxids, score = line.split("\t")
+                score = float(score)
+                if query not in best or score > best[query][0]:
+                    best[query] = (score, set(taxids.split(";")))
+                elif score == best[query][0]:
+                    best[query][1].update(taxids.split(";"))
+            return {query: taxa for query, (_, taxa) in best.items()}
+
+        self.assertEqual(best_taxids("db"), {"q1": {"11"}, "q2": {"12"}})
+        self.assertEqual(best_taxids("search-output/data/db"), best_taxids("db"))
+
     @unittest.skipUnless(shutil.which("blastdbcmd"), "blastdbcmd must be on PATH")
     def test_database_and_multidefline(self):
         self.make_db(5)
@@ -133,7 +217,9 @@ class TestTaxonClusterDb(unittest.TestCase):
         all_records = subprocess.run(
             ["blastdbcmd", "-db", db, "-entry", "all", "-outfmt", "%o %s %T"],
             cwd=self.work, capture_output=True, text=True, check=True)
-        self.assertEqual(len(all_records.stdout.splitlines()), 4)
+        oids = [int(line.split()[0]) for line in all_records.stdout.splitlines()]
+        self.assertEqual(sorted(set(oids)), [0, 1, 2, 3])
+        self.assertEqual(oids.count(0), 2)
         alternate = subprocess.run(
             ["blastdbcmd", "-db", db, "-entry", "a2", "-outfmt", "%s"],
             cwd=self.work, capture_output=True, text=True, check=True)
@@ -155,12 +241,61 @@ class TestTaxonClusterDb(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.work.glob("db.*")})
 
-    def test_writer_failure_not_published(self):
+    @unittest.skipUnless(shutil.which("blastdbcmd"), "blastdbcmd must be on PATH")
+    def test_output_path_with_spaces(self):
         self.make_db(5)
-        env = dict(os.environ, BLASTDB_LMDB_MAP_SIZE="1")
-        result = self.run_cluster("-out_dir", "failed", env=env)
+        result = self.run_cluster("-out_dir", "output with spaces")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = subprocess.run(
+            ["blastdbcmd", "-db", '"output with spaces/data/db"', "-entry", "all",
+             "-outfmt", "%o"], cwd=self.work, check=True, capture_output=True, text=True)
+        self.assertEqual(set(records.stdout.splitlines()), {"0", "1", "2", "3"})
+
+    def test_input_path_with_spaces(self):
+        self.make_db(5)
+        directory = self.work / "source with spaces"
+        directory.mkdir()
+        for path in self.work.glob("db.*"):
+            path.rename(directory / path.name)
+        result = subprocess.run(
+            ["taxonclusterdb", "-db", "source with spaces/db", "-out_dir", "output"],
+            cwd=self.work, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.work / "output/data/clusters.tsv").read_text(),
+                         "representative_oid\tmember_oid\n"
+                         "0\t0\n0\t1\n2\t2\n3\t3\n4\t4\n")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file size limits")
+    def test_writer_failure_not_published(self):
+        import resource
+
+        self.make_db(5)
+        def limit_output_file_size():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (256, 256))
+
+        result = self.run_cluster("-out_dir", "failed", preexec_fn=limit_output_file_size)
         self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Building a new DB", result.stderr)
         self.assertFalse((self.work / "failed" / "data").exists())
+
+    @unittest.skipUnless(shutil.which("dustmasker") and shutil.which("blastdbcmd"),
+                         "dustmasker and blastdbcmd must be on PATH")
+    def test_standard_dust_metadata_and_masks(self):
+        (self.work / "input.fa").write_text(">a\n" + "A" * 100 + "\n"
+                                             ">b\n" + "A" * 100 + "\n")
+        (self.work / "taxids.txt").write_text("a 11\nb 11\n")
+        subprocess.run(["dustmasker", "-in", "input.fa", "-parse_seqids",
+                        "-outfmt", "maskinfo_asn1_bin", "-out", "masks.asnb"],
+                       cwd=self.work, check=True, capture_output=True, text=True)
+        subprocess.run(["makeblastdb", "-in", "input.fa", "-dbtype", "nucl",
+                        "-parse_seqids", "-taxid_map", "taxids.txt",
+                        "-blastdb_version", "5", "-mask_data", "masks.asnb", "-out", "db"],
+                       cwd=self.work, check=True, capture_output=True, text=True)
+        result = self.run_cluster("-out_dir", "standard-mask")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = subprocess.run(["blastdbcmd", "-db", "standard-mask/data/db", "-info"],
+                              cwd=self.work, check=True, capture_output=True, text=True)
+        self.assertRegex(info.stdout, r"(?m)^\s*\d+\s+dust\s+")
 
     @unittest.skipUnless(shutil.which("dustmasker") and shutil.which("blastdbcmd"),
                          "dustmasker and blastdbcmd must be on PATH")

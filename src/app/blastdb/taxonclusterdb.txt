@@ -1,7 +1,17 @@
 taxonclusterdb: experimental taxon-aware nucleotide clustering
 =============================================================
 
-Build taxonclusterdb with the toolkit. From an existing v5 nucleotide database:
+To build the application and its dependencies with CMake from the checkout:
+
+    ./cmake-configure --without-debug --with-projects=app/blastdb \
+        --with-build-root=taxon-build
+    cmake --build taxon-build/build --target taxonclusterdb -j 2
+
+The executable is taxon-build/bin/taxonclusterdb. CMake configuration also
+requires the toolkit's normal build prerequisites; the build target includes
+its toolkit library dependencies.
+
+From an existing v5 nucleotide database:
 
     taxonclusterdb -db /path/to/source -out_dir /path/to/new-directory
     blastdbcmd -db /path/to/new-directory/data/db -info
@@ -140,6 +150,7 @@ Focused tests (run from the checkout):
     ./taxon-test
     python3 src/app/blastdb/taxonclusterdb_test.py
 
-Integration tests require makeblastdb and taxonclusterdb on PATH; one also
-requires blastdbcmd. They create small inputs and databases in the current
-directory and remove them afterwards.
+Integration tests require makeblastdb and taxonclusterdb on PATH. Some tests
+also require blastdbcmd, blastdb_aliastool, blastn, or dustmasker; unavailable
+tools cause the corresponding tests to be skipped. They create small inputs
+and databases in the current directory and remove them afterwards.

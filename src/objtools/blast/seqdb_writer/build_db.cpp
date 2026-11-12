@@ -1136,6 +1136,25 @@ CBuildDatabase::CBuildDatabase(const string & dbname,
                                bool           limit_defline,
                                Uint8          oid_masks,
                                bool scan_bioseq_4_cfastareader_usrobj)
+    : CBuildDatabase(dbname, title, is_protein, sparse, parse_seqids,
+                     use_gi_mask, logfile, long_seqids, dbver, limit_defline,
+                     oid_masks, scan_bioseq_4_cfastareader_usrobj, true)
+{
+}
+
+CBuildDatabase::CBuildDatabase(const string & dbname,
+                               const string & title,
+                               bool           is_protein,
+                               bool           sparse,
+                               bool           parse_seqids,
+                               bool           use_gi_mask,
+                               ostream      * logfile,
+                               bool           long_seqids,
+                               EBlastDbVersion        dbver,
+                               bool           limit_defline,
+                               Uint8          oid_masks,
+                               bool scan_bioseq_4_cfastareader_usrobj,
+                               bool           delete_existing)
     : m_IsProtein    (is_protein),
       m_KeepLinks    (false),
       m_KeepMbits    (false),
@@ -1162,7 +1181,7 @@ CBuildDatabase::CBuildDatabase(const string & dbname,
     m_LogFile << "New DB title:  " << title << endl;
     const string mol_type(is_protein ? "Protein" : "Nucleotide");
     m_LogFile << "Sequence type: " << mol_type << endl;
-    if (DeleteBlastDb(output_dbname, ParseMoleculeTypeString(mol_type))) {
+    if (delete_existing && DeleteBlastDb(output_dbname, ParseMoleculeTypeString(mol_type))) {
         m_LogFile << "Deleted existing " << mol_type
             << " BLAST database named " << output_dbname << endl;
     }

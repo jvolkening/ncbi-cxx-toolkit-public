@@ -188,7 +188,9 @@ static void s_Verify(CSeqDBExpert& source, const string& output,
                      const vector<int>& representatives,
                      const map<int, int>& cluster_taxids, CRepresentativeSource& raw)
 {
-    CSeqDBExpert result(output, CSeqDB::eNucleotide);
+    string quoted_output;
+    SeqDB_CombineAndQuote(vector<string>{output}, quoted_output);
+    CSeqDBExpert result(quoted_output, CSeqDB::eNucleotide);
     if (result.GetBlastDbVersion() != eBDB_Version5 ||
         result.GetNumOIDs() != static_cast<int>(representatives.size())) {
         NCBI_THROW(CSeqDBException, eFileErr, "Output database count/version mismatch");
@@ -267,7 +269,7 @@ void CTaxonClusterApp::Init()
     args->AddOptionalKey("out_dir", "directory",
                          "Create a new directory containing a verified v5 database and report",
                          CArgDescriptions::eString);
-    args->AddOptionalKey("tax_nodes", "nodes.dmp",
+    args->AddOptionalKey("tax_nodes", "nodes_file",
                          "NCBI taxonomy nodes.dmp; permit clustering within eligible sub-species clades",
                          CArgDescriptions::eInputFile);
     args->AddFlag("near",
@@ -287,7 +289,13 @@ int CTaxonClusterApp::Run()
         CNcbiIstream& input = GetArgs()["tax_nodes"].AsInputFile();
         taxonomy.reset(new taxon_exact::CTaxonomy(input));
     }
-    CSeqDBExpert db(GetArgs()["db"].AsString(), CSeqDB::eNucleotide);
+    string dbname = GetArgs()["db"].AsString();
+    if (CFile(dbname + ".nin").Exists() || CFile(dbname + ".nal").Exists()) {
+        string quoted;
+        SeqDB_CombineAndQuote(vector<string>{dbname}, quoted);
+        dbname = quoted;
+    }
+    CSeqDBExpert db(dbname, CSeqDB::eNucleotide);
     if (db.GetBlastDbVersion() != eBDB_Version5) {
         NCBI_THROW(CSeqDBException, eArgErr, "A BLAST v5 database is required");
     }
@@ -424,9 +432,11 @@ int CTaxonClusterApp::Run()
         }
         string prefix = CDirEntry::ConcatPath(stage, "db");
         {
+            // The new staging directory cannot contain an old database. Avoid
+            // caching negative file lookups before verifying the new output.
             CBuildDatabase writer(prefix, "Taxon cluster representatives", false,
                                   false, true, false, &NcbiCerr, true,
-                                  eBDB_Version5, false, 0);
+                                  eBDB_Version5, false, 0, true, false);
             writer.SetPreserveRawHeaders();
             CRef<CRepresentativeSource> raw(
                 new CRepresentativeSource(db, representatives, cluster_taxids, writer));
