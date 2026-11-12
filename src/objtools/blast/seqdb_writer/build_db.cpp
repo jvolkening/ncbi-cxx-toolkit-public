@@ -974,7 +974,9 @@ bool CBuildDatabase::AddSequences(IRawSequenceSource & src)
                            "Error in raw data: no headers provided");
             }
 
-            x_EditHeaders(deflines);
+            if (!m_PreserveRawHeaders) {
+                x_EditHeaders(deflines);
+            }
 
             m_OutputDb->AddSequence(sequence, ambiguities);
             x_AddPig(deflines);

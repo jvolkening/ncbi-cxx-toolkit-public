@@ -344,6 +344,12 @@ public:
     /// @return True if at least one sequence was added.
     bool AddSequences(IRawSequenceSource & src);
 
+    /// Copy raw-source deflines without applying taxid or membership edits.
+    /// This affects only AddSequences(IRawSequenceSource&).
+    void SetPreserveRawHeaders(bool preserve = true) {
+        m_PreserveRawHeaders = preserve;
+    }
+
     /// Finish building a new database.
     ///
     /// This method closes the newly constructed database, flushing
@@ -592,6 +598,8 @@ private:
 
     /// True for a protein database, false for nucleotide.
     bool m_IsProtein;
+
+    bool m_PreserveRawHeaders = false;
 
     /// True to keep linkout bits from source dbs, false to discard.
     /// DEPRECATED

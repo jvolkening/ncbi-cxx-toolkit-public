@@ -1,0 +1,108 @@
+taxonclusterdb: experimental taxon-aware nucleotide clustering
+=============================================================
+
+Build taxonclusterdb with the toolkit. From an existing v5 nucleotide database:
+
+    taxonclusterdb -db /path/to/source -out_dir /path/to/new-directory
+    blastdbcmd -db /path/to/new-directory/data/db -info
+
+Add -near to enable experimental near-duplicate clustering:
+
+    taxonclusterdb -db /path/to/source -near -out_dir /path/to/new-directory
+
+The output directory must not already exist, and its parent must exist. A new
+directory isolates the writer from every existing input database, including
+aliases and symlinked input paths. Do not concurrently change the input or the
+output directory, and use a trusted parent directory. Building, report output,
+and readback verification take place under new-directory/.incomplete; only
+after all succeed is that directory renamed to new-directory/data. A failed
+or interrupted run may leave .incomplete and requires manual removal of the
+new directory before retrying. Do not use anything in .incomplete. Check the
+exit status; data is published only on success. Never redirect stdout to an
+input or output database file.
+
+data/db is a compact v5 search database. data/clusters.tsv has one row per
+included source OID, ordered by member OID: representative_oid, member_oid
+(tab-separated). Representatives are the first source OID in each cluster.
+In ascending representative OID order they correspond to output OIDs 0, 1, ...
+OIDs are relative to the exact source database/alias and volume order used.
+Retain the source unchanged if you need to interpret the report or retrieve
+removed member information.
+
+To produce only the OID report without a database:
+
+    taxonclusterdb -db /path/to/source > clusters.tsv
+
+Check the exit status and discard a partial report on failure.
+
+By default, records cluster only when complete forward nucleotide strings, the
+sets of all positive primary and leaf taxids across their deflines, and the
+ranges for every available mask algorithm match. Each defline must have a positive primary
+taxid; zero/negative leaf IDs, missing IDs, taxonomy or deflines, and empty
+sequences make that record a singleton. Different taxonomy sets never merge.
+Ambiguity codes compare literally, not as wildcards. Reverse complements are
+not merged. Hashes only select candidates; full sequences and masks resolve
+collisions. IDs do not select records.
+
+With -near, a representative and member may also merge if their complete
+taxid sets and masks match, both sequences are 100-10000 bases, and their
+global edit distance (substitutions plus single-base insertions and deletions)
+is at most floor(longer length / 100). This is at least 99% identity under this
+edit-distance definition, not BLAST percent identity. Each member is checked
+against its actual representative, not transitively against another member.
+The first matching candidate in OID order is used. Below 100 bases and above
+10000 bases, only exact clustering is attempted.
+
+Near candidates share at least one of the 16 smallest hashes of distinct
+unambiguous 15-mers. Index entries with more than 64 representatives are
+ignored, and only the first 256 candidates encountered are verified. These
+limits and the sparse sketch make candidate generation incomplete: even
+sequences meeting the threshold can remain separate. Sequences lacking a
+shared unambiguous 15-mer cannot merge approximately. Hash matches alone
+never cause a merge.
+
+Near clustering can remove a distinctive local region even when whole-sequence
+identity is high. Short queries, taxon ties and best-hit assignments can
+change; matching masks and taxids do not guarantee equivalent search results.
+Benchmark against the original database on representative queries before use.
+
+The writer copies the representative's raw sequence and ambiguity data,
+complete defline set, masks and user columns. It rereads the output and checks
+representative sequences, deflines, mask ranges and metadata, column metadata
+and blobs, and output OID count before publication. Source algorithms may be
+renumbered in the output. Databases with multiple volumes and columns are
+rejected because SeqDB's merged column metadata can hide volume conflicts;
+in either mode multi-volume masking and mask metadata that cannot be mapped
+unambiguously are rejected. Representatives with
+missing deflines, missing IDs, or raw data the writer cannot encode cause an
+explicit failure, rather than being dropped. No identifier lookup is used
+to choose representatives, but duplicate IDs may remain ambiguous in the
+output's normal BLAST indexes.
+
+Only representative metadata is retained. Removed members' accessions,
+deflines, titles, IDs, memberships, and column blobs are not transferred to
+the representative. The TSV maps OIDs, not identifiers or taxonomy. Thus this
+is not an accession-preserving database, and taxonomic reporting of removed
+records requires the original database and mapping. Search statistics and
+E-values can differ because the database size and composition changed; do not
+compare E-values as if searching the original database.
+
+The index stores taxid vectors, lengths, hashes and representative OIDs in
+memory; -near also stores up to 16 anchor entries per representative, and
+output mode retains all representative OIDs. Representative
+sequences and masks are reread for comparison and verification. Large
+databases, common sequences or collisions can require substantial memory and
+I/O; near-distance checks can be expensive. There is no bounded-memory or
+throughput guarantee. This is not yet validated at core_nt scale. Results depend on
+SeqDB's OID enumeration and the unchanged source view. Output database binary
+files need not be byte-for-byte reproducible (for example, writer timestamps).
+
+Focused tests (run from the checkout):
+
+    g++ -std=c++14 src/app/blastdb/taxon_exact_cluster_test.cpp -o taxon-test
+    ./taxon-test
+    python3 src/app/blastdb/taxonclusterdb_test.py
+
+Integration tests require makeblastdb and taxonclusterdb on PATH; one also
+requires blastdbcmd. They create small inputs and databases in the current
+directory and remove them afterwards.

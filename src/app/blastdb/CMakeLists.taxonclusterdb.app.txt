@@ -1,0 +1,7 @@
+# $Id$
+NCBI_begin_app(taxonclusterdb)
+  NCBI_sources(taxonclusterdb)
+  NCBI_uses_toolkit_libraries(blastinput writedb)
+  NCBI_add_definitions(NCBI_MODULE=BLASTDB)
+  NCBI_requires(-Cygwin)
+NCBI_end_app()
