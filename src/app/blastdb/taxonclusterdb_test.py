@@ -69,6 +69,56 @@ class TestTaxonClusterDb(unittest.TestCase):
                          "representative_oid\tmember_oid\n"
                          "0\t0\n0\t1\n0\t2\n3\t3\n")
 
+    def test_configurable_edit_percent(self):
+        rng = random.Random(42)
+        sequence = "".join(rng.choice("ACGT") for _ in range(300))
+        changed = list(sequence)
+        for i in (0, 50, 100, 150):
+            changed[i] = "C" if changed[i] == "A" else "A"
+        (self.work / "input.fa").write_text(">a\n" + sequence + "\n>b\n"
+                                            + "".join(changed) + "\n")
+        (self.work / "taxids.txt").write_text("a 11\nb 11\n")
+        self.make_db(5)
+        strict = self.run_cluster("-near")
+        self.assertEqual(strict.returncode, 0, strict.stderr)
+        self.assertEqual(strict.stdout, "representative_oid\tmember_oid\n0\t0\n1\t1\n")
+        relaxed = self.run_cluster("-near", "-max_edit_percent", "2")
+        self.assertEqual(relaxed.returncode, 0, relaxed.stderr)
+        self.assertEqual(relaxed.stdout, "representative_oid\tmember_oid\n0\t0\n0\t1\n")
+        invalid = self.run_cluster("-near", "-max_edit_percent", "100.1")
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertEqual(invalid.stdout, "")
+
+    @unittest.skipUnless(shutil.which("blastdbcmd"), "blastdbcmd must be on PATH")
+    def test_taxonomy_lca_and_output_taxids(self):
+        (self.work / "nodes.dmp").write_text(
+            "1 | 1 | no rank |\n10 | 1 | species |\n11 | 10 | no rank |\n"
+            "12 | 11 | no rank |\n13 | 12 | no rank |\n14 | 12 | strain |\n"
+            "15 | 11 | strain |\n18 | 13 | no rank |\n")
+        (self.work / "input.fa").write_text(
+            "".join(">" + name + "\n" + base * 300 + "\n"
+                    for name, base in (("a", "A"), ("b", "A"), ("c", "A"),
+                                       ("d", "A"), ("e", "A"), ("g", "C"),
+                                       ("h", "C"))))
+        (self.work / "taxids.txt").write_text(
+            "a 13\nb 18\nc 14\nd 15\ne 11\ng 13\nh 18\n")
+        self.make_db(5)
+        default = self.run_cluster()
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertIn("1\t1\n", default.stdout)
+        result = self.run_cluster("-tax_nodes", "nodes.dmp", "-out_dir", "ranked")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.work / "ranked/data/clusters.tsv").read_text(),
+                         "representative_oid\tmember_oid\n"
+                         "0\t0\n0\t1\n0\t2\n3\t3\n4\t4\n5\t5\n5\t6\n")
+        for accession, expected in (("a", "12"), ("g", "13"), ("d", "15"),
+                                    ("e", "11")):
+            taxid = subprocess.run(
+                ["blastdbcmd", "-db", "ranked/data/db", "-entry", accession,
+                 "-outfmt", "%T"], cwd=self.work, check=True,
+                capture_output=True, text=True)
+            self.assertEqual(taxid.stdout.strip(), expected)
+
     @unittest.skipUnless(shutil.which("blastdbcmd"), "blastdbcmd must be on PATH")
     def test_database_and_multidefline(self):
         self.make_db(5)

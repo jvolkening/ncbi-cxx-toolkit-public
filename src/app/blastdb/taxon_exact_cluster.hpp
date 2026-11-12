@@ -21,38 +21,92 @@ struct SRecord {
     std::vector<int> taxids;
     TMasks masks;
     bool complete_taxonomy = false;
+    int clade = 0;
 };
 
-// Global edit distance, counting substitutions and single-base insertions and
-// deletions. Ambiguity codes compare literally.
-inline bool NearEqual(const std::string& a, const std::string& b)
+// Percent is stored in millionths so threshold rounding is exact.
+inline std::uint32_t ParseEditPercent(const std::string& text)
+{
+    if (text.empty()) throw std::invalid_argument("Edit percent is empty");
+    std::uint32_t whole = 0, fraction = 0, places = 0;
+    bool decimal = false, digit = false;
+    for (char c : text) {
+        if (c == '.' && !decimal) {
+            decimal = true;
+        } else if (c >= '0' && c <= '9') {
+            digit = true;
+            if (decimal) {
+                if (++places > 6) throw std::invalid_argument("Edit percent supports at most six decimal places");
+                fraction = fraction * 10 + (c - '0');
+            } else {
+                if (whole > 100 || whole * 10 + (c - '0') > 100) {
+                    throw std::invalid_argument("Edit percent must be between 0 and 100");
+                }
+                whole = whole * 10 + (c - '0');
+            }
+        } else {
+            throw std::invalid_argument("Invalid edit percent");
+        }
+    }
+    if (!digit) throw std::invalid_argument("Invalid edit percent");
+    while (places++ < 6) fraction *= 10;
+    if (whole == 100 && fraction != 0) {
+        throw std::invalid_argument("Edit percent must be between 0 and 100");
+    }
+    return whole * 1000000 + fraction;
+}
+
+// Bounded wavefront edit distance. Exhausting the work budget rejects a
+// candidate, so approximate search never accepts an unverified distance.
+inline bool NearEqual(const std::string& a, const std::string& b,
+                      std::uint32_t edit_percent = 1000000)
 {
     const std::size_t longest = std::max(a.size(), b.size());
-    const std::size_t limit = longest / 100;
-    if (longest > 10000 || limit == 0 ||
+    if (edit_percent > 100000000) throw std::invalid_argument("Edit percent exceeds 100");
+    if (longest < 100 || longest > 10000 || std::min(a.size(), b.size()) < 100) return false;
+    const std::size_t limit =
+        static_cast<std::uint64_t>(longest) * edit_percent / 100000000;
+    if (limit == 0 ||
         longest - std::min(a.size(), b.size()) > limit) {
         return false;
     }
-    const std::size_t inf = limit + 1;
-    std::vector<std::size_t> prev(b.size() + 1, inf), cur(b.size() + 1, inf);
-    for (std::size_t j = 0; j <= std::min(b.size(), limit); ++j) prev[j] = j;
-    for (std::size_t i = 1; i <= a.size(); ++i) {
-        const std::size_t lo = i > limit ? i - limit : 0;
-        const std::size_t hi = std::min(b.size(), i + limit);
-        if (lo > hi) return false;
-        if (lo > 0) cur[lo - 1] = inf;
-        if (lo == 0) cur[0] = i;
-        std::size_t row_min = lo == 0 ? cur[0] : inf;
-        for (std::size_t j = std::max<std::size_t>(lo, 1); j <= hi; ++j) {
-            cur[j] = std::min({inf, prev[j] + 1, cur[j - 1] + 1,
-                               prev[j - 1] + (a[i - 1] != b[j - 1])});
-            row_min = std::min(row_min, cur[j]);
+    const int n = static_cast<int>(a.size()), m = static_cast<int>(b.size());
+    const int max_edits = static_cast<int>(limit), offset = max_edits + 1;
+    std::vector<int> previous(2 * max_edits + 3, -1), current(previous.size(), -1);
+    std::size_t work = 0;
+    const std::size_t work_limit = 500000;
+    auto extend = [&](int x, int diagonal) {
+        int y = x - diagonal;
+        while (x < n && y < m) {
+            if (++work > work_limit) return -1;
+            if (a[x] != b[y]) break;
+            ++x;
+            ++y;
         }
-        if (hi < b.size()) cur[hi + 1] = inf;
-        if (row_min > limit) return false;
-        prev.swap(cur);
+        return x;
+    };
+    previous[offset] = extend(0, 0);
+    if (previous[offset] == n && n == m) return true;
+    for (int edits = 1; edits <= max_edits; ++edits) {
+        for (int diagonal = -edits; diagonal <= edits; ++diagonal) {
+            if (++work > work_limit) return false;
+            int best = -1;
+            int x = previous[offset + diagonal - 1];
+            if (x >= 0 && x < n) best = x + 1;
+            x = previous[offset + diagonal + 1];
+            if (x >= 0 && x - (diagonal + 1) < m) best = std::max(best, x);
+            x = previous[offset + diagonal];
+            if (x >= 0 && x < n && x - diagonal < m) best = std::max(best, x + 1);
+            if (best >= 0) {
+                best = extend(best, diagonal);
+                if (best < 0) return false;
+                if (best == n && best - diagonal == m) return true;
+            }
+            current[offset + diagonal] = best;
+        }
+        previous.swap(current);
     }
-    return prev[b.size()] <= limit;
+    return false;
 }
 
 // Bottom 16 distinct 15-mer hashes; non-ACGT bases break a k-mer.
@@ -91,10 +145,11 @@ public:
     using THash = std::function<std::size_t(const std::string&)>;
 
     explicit CClusterer(TRead read, THash hash = std::hash<std::string>(),
-                        bool near = false)
-        : m_Read(std::move(read)), m_Hash(std::move(hash)), m_Near(near) {}
+                        bool near = false, std::uint32_t edit_percent = 1000000)
+        : m_Read(std::move(read)), m_Hash(std::move(hash)), m_Near(near),
+          m_EditPercent(edit_percent) {}
 
-    int Add(int oid, SRecord record)
+    int Add(int oid, const SRecord& record)
     {
         if (oid < 0 || oid <= m_LastOid) {
             throw std::invalid_argument("OIDs must be nonnegative and increasing");
@@ -104,13 +159,15 @@ public:
             record.sequence.empty()) {
             return oid;
         }
-        std::sort(record.taxids.begin(), record.taxids.end());
-        record.taxids.erase(std::unique(record.taxids.begin(), record.taxids.end()),
-                            record.taxids.end());
-        if (record.taxids.front() <= 0) {
+        auto taxids = record.taxids;
+        std::sort(taxids.begin(), taxids.end());
+        taxids.erase(std::unique(taxids.begin(), taxids.end()), taxids.end());
+        if (taxids.front() <= 0) {
             return oid;
         }
-        TKey key(record.taxids, record.sequence.size(), m_Hash(record.sequence));
+        const std::vector<int> taxon_key = record.clade > 0
+            ? std::vector<int>{-record.clade} : taxids;
+        TKey key(taxon_key, record.sequence.size(), m_Hash(record.sequence));
         auto exact = m_Representatives.find(key);
         if (exact != m_Representatives.end()) {
             for (int candidate : exact->second) {
@@ -121,12 +178,12 @@ public:
                 }
             }
         }
-        if (m_Near && record.sequence.size() >= 100 &&
+        if (m_Near && m_EditPercent != 0 && record.sequence.size() >= 100 &&
             record.sequence.size() <= 10000) {
             const auto anchors = Anchors(record.sequence);
             std::set<int> near_candidates;
             for (auto anchor : anchors) {
-                auto it = m_Anchors.find(std::make_pair(record.taxids, anchor));
+                auto it = m_Anchors.find(std::make_pair(taxon_key, anchor));
                 if (it == m_Anchors.end() ||
                     (!it->second.empty() && it->second.front() == -1)) continue;
                 for (int candidate : it->second) {
@@ -138,12 +195,12 @@ public:
             for (int candidate : near_candidates) {
                 SRecord representative = m_Read(candidate);
                 if (record.masks == representative.masks &&
-                    NearEqual(record.sequence, representative.sequence)) {
+                    NearEqual(record.sequence, representative.sequence, m_EditPercent)) {
                     return candidate;
                 }
             }
             for (auto anchor : anchors) {
-                auto& bucket = m_Anchors[std::make_pair(record.taxids, anchor)];
+                auto& bucket = m_Anchors[std::make_pair(taxon_key, anchor)];
                 if (!bucket.empty() && bucket.front() == -1) continue;
                 if (bucket.size() == 64) {
                     bucket.assign(1, -1);
@@ -162,6 +219,7 @@ private:
     TRead m_Read;
     THash m_Hash;
     bool m_Near;
+    std::uint32_t m_EditPercent;
     int m_LastOid = -1;
     std::map<TKey, std::vector<int>> m_Representatives;
     std::map<TAnchorKey, std::vector<int>> m_Anchors;

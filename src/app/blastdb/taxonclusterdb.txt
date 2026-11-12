@@ -8,7 +8,15 @@ Build taxonclusterdb with the toolkit. From an existing v5 nucleotide database:
 
 Add -near to enable experimental near-duplicate clustering:
 
-    taxonclusterdb -db /path/to/source -near -out_dir /path/to/new-directory
+    taxonclusterdb -db /path/to/source -near -max_edit_percent 2 \
+        -out_dir /path/to/new-directory
+
+To permit different taxids in qualifying subspecies clades, provide the
+uncompressed nodes.dmp from NCBI's taxonomy dump, using a taxonomy snapshot
+appropriate for the source database:
+
+    taxonclusterdb -db /path/to/source -tax_nodes /path/to/nodes.dmp \
+        -near -max_edit_percent 1 -out_dir /path/to/new-directory
 
 The output directory must not already exist, and its parent must exist. A new
 directory isolates the writer from every existing input database, including
@@ -39,16 +47,40 @@ By default, records cluster only when complete forward nucleotide strings, the
 sets of all positive primary and leaf taxids across their deflines, and the
 ranges for every available mask algorithm match. Each defline must have a positive primary
 taxid; zero/negative leaf IDs, missing IDs, taxonomy or deflines, and empty
-sequences make that record a singleton. Different taxonomy sets never merge.
-Ambiguity codes compare literally, not as wildcards. Reverse complements are
-not merged. Hashes only select candidates; full sequences and masks resolve
-collisions. IDs do not select records.
+sequences make that record a singleton. Without -tax_nodes different taxonomy
+sets never merge. Ambiguity codes compare literally, not as wildcards. Reverse
+complements are not merged. Hashes only select candidates; full sequences and
+masks resolve collisions. IDs do not select records.
 
-With -near, a representative and member may also merge if their complete
-taxid sets and masks match, both sequences are 100-10000 bases, and their
+With -tax_nodes, records with different sets of taxids may merge only if all
+their positive primary and leaf taxids fall under the same ancestor exactly
+two parent-child edges below a species node. Every edge counts, including
+"no rank" nodes. Equivalently, the LCA of all those taxids must be at that
+ancestor or below it. Different taxa whose LCA is the species, one edge below
+species, or above species do not merge. The same restriction applies to
+records with multiple taxids. Identical taxid sets can still cluster even when
+they span clades or are absent from nodes.dmp, as in the default mode.
+
+For clusters containing different taxid sets, the writer replaces the taxid
+of each representative defline with the actual LCA of all taxids in the
+cluster and removes the deflines' leaf-taxid links. This LCA can be deeper
+than the two-edge cutoff. Representatives with only identical taxid sets,
+including singletons, retain their original taxids. Report-only mode does not
+produce rewritten taxids; retain the original database and nodes.dmp to
+interpret its OID mapping. Taxids missing from nodes.dmp are not used for
+cross-taxid merges; a warning reports their count. A stale taxonomy snapshot
+can therefore miss merges, or yield different ancestry than the intended one.
+Malformed nodes and broken or cyclic parent paths encountered during lookup
+cause an error.
+
+With -near, a representative and member may also merge if their taxonomy is
+compatible as above, their masks match, both sequences are 100-10000 bases, and their
 global edit distance (substitutions plus single-base insertions and deletions)
-is at most floor(longer length / 100). This is at least 99% identity under this
-edit-distance definition, not BLAST percent identity. Each member is checked
+is at most floor(longer length * max_edit_percent / 100). The default is 1%
+(at least 99% identity under this edit-distance definition, not BLAST percent
+identity). -max_edit_percent accepts 0 to 100 with up to six decimal places,
+and is used only with -near. Higher values can greatly increase runtime and
+the chance of losing distinct matches. Each member is checked
 against its actual representative, not transitively against another member.
 The first matching candidate in OID order is used. Below 100 bases and above
 10000 bases, only exact clustering is attempted.
@@ -56,10 +88,13 @@ The first matching candidate in OID order is used. Below 100 bases and above
 Near candidates share at least one of the 16 smallest hashes of distinct
 unambiguous 15-mers. Index entries with more than 64 representatives are
 ignored, and only the first 256 candidates encountered are verified. These
-limits and the sparse sketch make candidate generation incomplete: even
-sequences meeting the threshold can remain separate. Sequences lacking a
-shared unambiguous 15-mer cannot merge approximately. Hash matches alone
-never cause a merge.
+limits and the sparse sketch make candidate generation incomplete. The
+wavefront edit-distance check also stops after 500,000 units of work per
+candidate and rejects that candidate if the budget is exhausted. Thus even
+sequences meeting the threshold can remain separate, especially at high
+thresholds. Sequences lacking a shared unambiguous 15-mer cannot merge
+approximately. Hash matches alone never cause a merge, and a candidate is
+merged only if its distance was verified within the threshold.
 
 Near clustering can remove a distinctive local region even when whole-sequence
 identity is high. Short queries, taxon ties and best-hit assignments can
@@ -67,8 +102,9 @@ change; matching masks and taxids do not guarantee equivalent search results.
 Benchmark against the original database on representative queries before use.
 
 The writer copies the representative's raw sequence and ambiguity data,
-complete defline set, masks and user columns. It rereads the output and checks
-representative sequences, deflines, mask ranges and metadata, column metadata
+defline set (with the taxid changes described above), masks and user columns.
+It rereads the output and checks representative sequences, expected deflines,
+mask ranges and metadata, column metadata
 and blobs, and output OID count before publication. Source algorithms may be
 renumbered in the output. Databases with multiple volumes and columns are
 rejected because SeqDB's merged column metadata can hide volume conflicts;
@@ -79,7 +115,7 @@ explicit failure, rather than being dropped. No identifier lookup is used
 to choose representatives, but duplicate IDs may remain ambiguous in the
 output's normal BLAST indexes.
 
-Only representative metadata is retained. Removed members' accessions,
+Except for the taxid changes above, only representative metadata is retained. Removed members' accessions,
 deflines, titles, IDs, memberships, and column blobs are not transferred to
 the representative. The TSV maps OIDs, not identifiers or taxonomy. Thus this
 is not an accession-preserving database, and taxonomic reporting of removed
@@ -88,8 +124,9 @@ E-values can differ because the database size and composition changed; do not
 compare E-values as if searching the original database.
 
 The index stores taxid vectors, lengths, hashes and representative OIDs in
-memory; -near also stores up to 16 anchor entries per representative, and
-output mode retains all representative OIDs. Representative
+memory; -near also stores up to 16 anchor entries per representative,
+-tax_nodes loads the taxonomy tree and caches encountered taxids, and output
+mode retains all representative OIDs. Representative
 sequences and masks are reread for comparison and verification. Large
 databases, common sequences or collisions can require substantial memory and
 I/O; near-distance checks can be expensive. There is no bounded-memory or

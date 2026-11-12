@@ -11,15 +11,34 @@
 #include <objtools/blast/seqdb_writer/build_db.hpp>
 
 #include "taxon_exact_cluster.hpp"
+#include "taxon_lineage.hpp"
 
 USING_NCBI_SCOPE;
 USING_SCOPE(objects);
 
+static CRef<CBlast_def_line_set> s_OutputHeaders(
+    CSeqDBExpert& db, int oid, const map<int, int>& cluster_taxids)
+{
+    CRef<CBlast_def_line_set> source = db.GetHdr(oid);
+    auto it = cluster_taxids.find(oid);
+    if (it == cluster_taxids.end() || source.Empty()) return source;
+    CRef<CBlast_def_line_set> adjusted(new CBlast_def_line_set);
+    adjusted->Assign(*source);
+    for (auto& defline : adjusted->Set()) {
+        if (defline.Empty()) {
+            NCBI_THROW(CSeqDBException, eArgErr, "Representative has an empty defline");
+        }
+        defline->SetTaxid(TAX_ID_FROM(int, it->second));
+        defline->ResetLinks();
+    }
+    return adjusted;
+}
+
 class CRepresentativeSource : public IRawSequenceSource {
 public:
     CRepresentativeSource(CSeqDBExpert& db, const vector<int>& oids,
-                          CBuildDatabase& writer)
-        : m_Db(db), m_Oids(oids)
+                          const map<int, int>& cluster_taxids, CBuildDatabase& writer)
+        : m_Db(db), m_Oids(oids), m_ClusterTaxids(cluster_taxids)
     {
         m_Db.ListColumns(m_Names);
         vector<string> volumes;
@@ -96,7 +115,7 @@ public:
         if (!m_Db.CheckOrFindOID(found) || found != oid) {
             NCBI_THROW(CSeqDBException, eFileErr, "Representative OID disappeared");
         }
-        deflines = m_Db.GetHdr(oid);
+        deflines = s_OutputHeaders(m_Db, oid, m_ClusterTaxids);
         if (deflines.Empty() || !deflines->CanGet() || deflines->Get().empty()) {
             NCBI_THROW(CSeqDBException, eArgErr, "Representative has no deflines");
         }
@@ -155,6 +174,7 @@ public:
 private:
     CSeqDBExpert& m_Db;
     const vector<int>& m_Oids;
+    const map<int, int>& m_ClusterTaxids;
     size_t m_Next = 0;
     const char* m_Sequence = nullptr;
     vector<string> m_Names;
@@ -166,7 +186,7 @@ private:
 
 static void s_Verify(CSeqDBExpert& source, const string& output,
                      const vector<int>& representatives,
-                     CRepresentativeSource& raw)
+                     const map<int, int>& cluster_taxids, CRepresentativeSource& raw)
 {
     CSeqDBExpert result(output, CSeqDB::eNucleotide);
     if (result.GetBlastDbVersion() != eBDB_Version5 ||
@@ -202,7 +222,8 @@ static void s_Verify(CSeqDBExpert& source, const string& output,
         string a, b;
         source.GetSequenceAsString(src_oid, a);
         result.GetSequenceAsString(dst_oid, b);
-        CRef<CBlast_def_line_set> ah = source.GetHdr(src_oid), bh = result.GetHdr(dst_oid);
+        CRef<CBlast_def_line_set> ah = s_OutputHeaders(source, src_oid, cluster_taxids);
+        CRef<CBlast_def_line_set> bh = result.GetHdr(dst_oid);
         if (a != b || ah.Empty() || bh.Empty() || !ah->Equals(*bh)) {
             NCBI_THROW(CSeqDBException, eFileErr, "Output sequence or deflines mismatch");
         }
@@ -246,13 +267,26 @@ void CTaxonClusterApp::Init()
     args->AddOptionalKey("out_dir", "directory",
                          "Create a new directory containing a verified v5 database and report",
                          CArgDescriptions::eString);
+    args->AddOptionalKey("tax_nodes", "nodes.dmp",
+                         "NCBI taxonomy nodes.dmp; permit clustering within eligible sub-species clades",
+                         CArgDescriptions::eInputFile);
     args->AddFlag("near",
-                  "Experimentally allow up to 1% global edit distance for sequences of 100-10000 bases");
+                  "Enable experimental near-duplicate clustering for sequences of 100-10000 bases");
+    args->AddDefaultKey("max_edit_percent", "percent",
+                        "Maximum global edit distance as a percentage of the longer sequence (0-100)",
+                        CArgDescriptions::eString, "1");
     SetupArgDescriptions(args.release());
 }
 
 int CTaxonClusterApp::Run()
 {
+    const auto edit_percent = taxon_exact::ParseEditPercent(
+        GetArgs()["max_edit_percent"].AsString());
+    unique_ptr<taxon_exact::CTaxonomy> taxonomy;
+    if (GetArgs()["tax_nodes"]) {
+        CNcbiIstream& input = GetArgs()["tax_nodes"].AsInputFile();
+        taxonomy.reset(new taxon_exact::CTaxonomy(input));
+    }
     CSeqDBExpert db(GetArgs()["db"].AsString(), CSeqDB::eNucleotide);
     if (db.GetBlastDbVersion() != eBDB_Version5) {
         NCBI_THROW(CSeqDBException, eArgErr, "A BLAST v5 database is required");
@@ -280,9 +314,8 @@ int CTaxonClusterApp::Run()
         }
     }
 
-    auto read = [&](int oid) {
+    auto read_taxonomy = [&](int oid) {
         taxon_exact::SRecord record;
-        db.GetSequenceAsString(oid, record.sequence);
         CRef<CBlast_def_line_set> headers = db.GetHdr(oid);
         record.complete_taxonomy = headers.NotEmpty() && headers->CanGet() &&
                                    !headers->Get().empty();
@@ -306,6 +339,18 @@ int CTaxonClusterApp::Run()
                 }
             }
         }
+        sort(record.taxids.begin(), record.taxids.end());
+        record.taxids.erase(unique(record.taxids.begin(), record.taxids.end()),
+                            record.taxids.end());
+        if (taxonomy && record.complete_taxonomy && !record.taxids.empty() &&
+            record.taxids.front() > 0) {
+            record.clade = taxonomy->Group(record.taxids);
+        }
+        return record;
+    };
+    auto read = [&](int oid) {
+        taxon_exact::SRecord record = read_taxonomy(oid);
+        db.GetSequenceAsString(oid, record.sequence);
         for (int algorithm : algorithms) {
             CSeqDB::TSequenceRanges ranges;
             db.GetMaskData(oid, algorithm, ranges);
@@ -334,12 +379,30 @@ int CTaxonClusterApp::Run()
     }
     CNcbiOstream& out = report ? *report : NcbiCout;
     taxon_exact::CClusterer clusterer(read, std::hash<std::string>(),
-                                     GetArgs()["near"].AsBoolean());
+                                     GetArgs()["near"].AsBoolean(), edit_percent);
     vector<int> representatives;
+    map<int, int> cluster_taxids;
     out << "representative_oid\tmember_oid\n";
     for (int oid = 0; db.CheckOrFindOID(oid); ++oid) {
-        int representative = clusterer.Add(oid, read(oid));
+        auto record = read(oid);
+        int representative = clusterer.Add(oid, record);
         if (report && representative == oid) representatives.push_back(oid);
+        if (report && taxonomy && representative != oid) {
+            auto rep = read_taxonomy(representative);
+            if (record.taxids != rep.taxids) {
+                if (!record.clade || record.clade != rep.clade) {
+                    NCBI_THROW(CSeqDBException, eArgErr, "Inconsistent taxonomic cluster");
+                }
+                vector<int> members = record.taxids;
+                auto prior = cluster_taxids.find(representative);
+                if (prior == cluster_taxids.end()) {
+                    members.insert(members.end(), rep.taxids.begin(), rep.taxids.end());
+                } else {
+                    members.push_back(prior->second);
+                }
+                cluster_taxids[representative] = taxonomy->Lca(members);
+            }
+        }
         out << representative << '\t' << oid << '\n';
         if (!out) {
             NCBI_THROW(CSeqDBException, eFileErr, "Error writing cluster report");
@@ -348,6 +411,10 @@ int CTaxonClusterApp::Run()
     out.flush();
     if (!out) {
         NCBI_THROW(CSeqDBException, eFileErr, "Error writing cluster report");
+    }
+    if (taxonomy && taxonomy->MissingCount()) {
+        LOG_POST(Warning << taxonomy->MissingCount()
+                 << " source taxids are absent from nodes.dmp; cross-taxid clustering was skipped for them");
     }
     if (report) {
         report->close();
@@ -361,11 +428,12 @@ int CTaxonClusterApp::Run()
                                   false, true, false, &NcbiCerr, true,
                                   eBDB_Version5, false, 0);
             writer.SetPreserveRawHeaders();
-            CRef<CRepresentativeSource> raw(new CRepresentativeSource(db, representatives, writer));
+            CRef<CRepresentativeSource> raw(
+                new CRepresentativeSource(db, representatives, cluster_taxids, writer));
             if (!writer.AddSequences(*raw) || !writer.EndBuild()) {
                 NCBI_THROW(CSeqDBException, eFileErr, "Failed to build output database");
             }
-            s_Verify(db, prefix, representatives, *raw);
+            s_Verify(db, prefix, representatives, cluster_taxids, *raw);
         }
         if (!CDir(stage).Rename(CDirEntry::ConcatPath(out_dir, "data"))) {
             NCBI_THROW(CSeqDBException, eFileErr, "Cannot publish output directory");

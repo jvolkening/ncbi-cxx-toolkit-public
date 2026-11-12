@@ -1,9 +1,11 @@
 /* This is a United States Government Work, freely available for public use. */
 #include "taxon_exact_cluster.hpp"
+#include "taxon_lineage.hpp"
 
 #include <cassert>
 #include <map>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 
 static std::size_t EditDistance(const std::string& a, const std::string& b)
@@ -76,6 +78,22 @@ int main()
     assert(NearEqual(sequence, substituted));
     assert(NearEqual(sequence, inserted));
     assert(!NearEqual(sequence, divergent));
+    assert(NearEqual(sequence, divergent, ParseEditPercent("2")));
+    assert(!NearEqual(sequence, substituted, ParseEditPercent("0")));
+    std::string thousand(1000, 'A'), one_edit = thousand;
+    one_edit[500] = 'C';
+    assert(NearEqual(thousand, one_edit, ParseEditPercent("0.1")));
+    assert(!NearEqual(thousand, one_edit, ParseEditPercent("0.099999")));
+    assert(ParseEditPercent("100.000000") == 100000000);
+    for (const char* invalid : {"", ".", "-1", "100.000001", "0.0000001", "nan"}) {
+        bool bad = false;
+        try {
+            ParseEditPercent(invalid);
+        } catch (const std::invalid_argument&) {
+            bad = true;
+        }
+        assert(bad);
+    }
     assert(!NearEqual(std::string(99, 'A'), std::string(98, 'A') + "C"));
     assert(!NearEqual(std::string(10001, 'A'), std::string(10001, 'A')));
 
@@ -90,7 +108,27 @@ int main()
             }
         }
         std::size_t longest = std::max(a.size(), b.size());
-        assert(NearEqual(a, b) == (EditDistance(a, b) <= longest / 100));
+        std::size_t distance = EditDistance(a, b);
+        for (const char* percent : {"1", "2", "5", "10", "100"}) {
+            std::uint32_t threshold = ParseEditPercent(percent);
+            std::size_t limit = longest * static_cast<std::uint64_t>(threshold) / 100000000;
+            bool expected = std::min(a.size(), b.size()) >= 100 && limit > 0 &&
+                            distance <= limit;
+            assert(NearEqual(a, b, threshold) == expected);
+        }
+    }
+    for (int trial = 0; trial < 30; ++trial) {
+        std::string a, b;
+        for (int i = 0; i < 100 + trial; ++i) {
+            a += "ACGT"[rng() % 4];
+            b += "ACGT"[rng() % 4];
+        }
+        std::size_t distance = EditDistance(a, b);
+        for (const char* percent : {"20", "40", "60", "80", "100"}) {
+            std::uint32_t threshold = ParseEditPercent(percent);
+            std::size_t limit = a.size() * static_cast<std::uint64_t>(threshold) / 100000000;
+            assert(NearEqual(a, b, threshold) == (distance <= limit));
+        }
     }
 
     std::map<int, SRecord> near_records;
@@ -107,4 +145,66 @@ int main()
     for (int oid = 0; oid != 7; ++oid) {
         assert(near_clusters.Add(oid, near_records.at(oid)) == near_expected[oid]);
     }
+
+    std::istringstream nodes(
+        "1 | 1 | no rank |\n"
+        "10 | 1 | species |\n"
+        "11 | 10 | no rank |\n"
+        "12 | 11 | no rank |\n"
+        "13 | 12 | no rank |\n"
+        "14 | 12 | strain |\n"
+        "15 | 11 | strain |\n"
+        "18 | 13 | no rank |\n");
+    CTaxonomy taxonomy(nodes);
+    assert(taxonomy.Group({10}) == 0);
+    assert(taxonomy.Group({11}) == 0);
+    assert(taxonomy.Group({12, 13, 14, 18}) == 12);
+    assert(taxonomy.Group({13, 15}) == 0);
+    assert(taxonomy.Group({10, 13}) == 0);
+    assert(taxonomy.Group({999}) == 0 && taxonomy.MissingCount() == 1);
+    assert(taxonomy.Group({13, 999}) == 0);
+    assert(taxonomy.Lca({13, 18}) == 13);
+    assert(taxonomy.Lca({13, 14, 18}) == 12);
+    assert(taxonomy.Lca({13, 15}) == 11);
+
+    std::map<int, SRecord> clade_records;
+    const std::vector<std::vector<int>> taxa = {
+        {13}, {18}, {14}, {15}, {11}, {13, 15}, {999}, {999}, {14}, {14}};
+    for (std::size_t oid = 0; oid < taxa.size(); ++oid) {
+        SRecord r;
+        r.sequence = oid == 8 ? substituted : sequence;
+        r.taxids = taxa[oid];
+        r.complete_taxonomy = true;
+        r.clade = taxonomy.Group(r.taxids);
+        if (oid == 9) r.masks = {{{1, 2}}};
+        clade_records.emplace(static_cast<int>(oid), r);
+    }
+    CClusterer clades([&](int oid) { return clade_records.at(oid); },
+                      std::hash<std::string>(), true);
+    const int clade_expected[] = {0, 0, 0, 3, 4, 5, 6, 6, 0, 9};
+    for (int oid = 0; oid != 10; ++oid) {
+        assert(clades.Add(oid, clade_records.at(oid)) == clade_expected[oid]);
+    }
+
+    for (const std::string& bad_nodes : {
+             std::string("1 | 1 | no rank |\n2 | 3 | no rank |\n3 | 2 | no rank |\n"),
+             std::string("1 | 1 | no rank |\n2 | 99 | no rank |\n")}) {
+        std::istringstream input(bad_nodes);
+        CTaxonomy bad_taxonomy(input);
+        bool bad = false;
+        try {
+            bad_taxonomy.Group({2});
+        } catch (const std::runtime_error&) {
+            bad = true;
+        }
+        assert(bad);
+    }
+    bool malformed = false;
+    try {
+        std::istringstream input("1 | 1 | no rank |\n1 | 1 | no rank |\n");
+        CTaxonomy bad_taxonomy(input);
+    } catch (const std::runtime_error&) {
+        malformed = true;
+    }
+    assert(malformed);
 }
